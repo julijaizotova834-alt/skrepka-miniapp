@@ -1,20 +1,6 @@
 """
 webapp_server.py (RU)
 Backend для Telegram Mini App "Brief AI" (skrepka-bot).
-
-Принимает аудиофайл любого размера через обычный HTTP-запрос напрямую с сервера
-(минуя ограничение Telegram Bot API на 20 МБ / 30 минут), обрабатывает его
-(Whisper -> Gemini) и отправляет готовый документ пользователю обратно в чат с ботом.
-
-Переменные окружения:
-  TELEGRAM_TOKEN   - токен бота (для отправки документов и проверки initData)
-  GROQ_API_KEY
-  GEMINI_API_KEY
-  DATABASE_URL
-  ALLOWED_ORIGIN   - домен, с которого грузится мини-приложение (для CORS)
-
-Запуск:
-  uvicorn webapp_server:app --host 0.0.0.0 --port 8000
 """
 
 import os
@@ -51,40 +37,29 @@ app.add_middleware(
 
 core.init_db()
 
-# upload_id -> {"path": str, "user_id": int, "username": str, "created_at": float}
 UPLOADS = {}
 UPLOAD_TTL_SECONDS = 60 * 60
-
-MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 ГБ
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 
 
 def validate_init_data(init_data: str) -> dict:
     if not init_data:
         raise HTTPException(status_code=401, detail="Нет initData")
-
     parsed = dict(parse_qsl(init_data, strict_parsing=True))
     received_hash = parsed.pop("hash", None)
     if not received_hash:
         raise HTTPException(status_code=401, detail="Нет hash в initData")
-
-    data_check_string = "\n".join(
-        f"{k}={v}" for k, v in sorted(parsed.items())
-    )
-
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
     secret_key = hmac.new(b"WebAppData", TELEGRAM_TOKEN.encode(), hashlib.sha256).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
     if not hmac.compare_digest(computed_hash, received_hash):
         raise HTTPException(status_code=401, detail="Неверная подпись initData")
-
     auth_date = int(parsed.get("auth_date", "0"))
     if time.time() - auth_date > 86400:
         raise HTTPException(status_code=401, detail="initData устарела, переоткройте мини-приложение")
-
     user = json.loads(parsed.get("user", "{}"))
     if not user.get("id"):
         raise HTTPException(status_code=401, detail="Нет данных пользователя")
-
     return user
 
 
@@ -105,24 +80,22 @@ def status(x_telegram_initdata: str = Header(None)):
     user_id = user["id"]
     username = user.get("username", "")
     full_name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
-
     core.register_user_if_new(user_id, username, full_name)
-    row = core.get_user_row(user_id)
-
-    if not row:
-        return {"is_subscribed": False, "remaining": core.FREE_LIMIT, "free_limit": core.FREE_LIMIT}
-
-    usage_count, is_subscribed, subscription_until = row
-    if is_subscribed and subscription_until and subscription_until.timestamp() > time.time():
+    info = core.get_user_info(user_id)
+    if not info:
+        return {"is_subscribed": False, "remaining": core.FREE_LIMIT, "free_limit": core.FREE_LIMIT, "audit_credits": 0}
+    if info['is_subscribed'] and info['until'] and info['until'].timestamp() > time.time():
         return {
             "is_subscribed": True,
-            "subscription_until": subscription_until.strftime("%d.%m.%Y"),
+            "tier": info['tier'] or 'basic',
+            "subscription_until": info['until'].strftime("%d.%m.%Y"),
+            "audit_credits": info['audit_credits'],
         }
-
     return {
         "is_subscribed": False,
-        "remaining": max(0, core.FREE_LIMIT - usage_count),
+        "remaining": max(0, core.FREE_LIMIT - info['usage_count']),
         "free_limit": core.FREE_LIMIT,
+        "audit_credits": info['audit_credits'],
     }
 
 
@@ -132,17 +105,11 @@ async def upload(file: UploadFile = File(...), x_telegram_initdata: str = Header
     user = validate_init_data(x_telegram_initdata)
     user_id = user["id"]
     username = user.get("username", "")
-
     if not core.check_access(user_id, username):
-        raise HTTPException(
-            status_code=403,
-            detail="Лимит бесплатных документов исчерпан. Оформите подписку командой /subscribe в боте."
-        )
-
+        raise HTTPException(status_code=403, detail="Лимит бесплатных документов исчерпан. Оформите подписку командой /subscribe в боте.")
     suffix = os.path.splitext(file.filename or "audio")[1] or ".audio"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
-
     size = 0
     with open(tmp_path, "wb") as out:
         while True:
@@ -155,17 +122,9 @@ async def upload(file: UploadFile = File(...), x_telegram_initdata: str = Header
                 os.remove(tmp_path)
                 raise HTTPException(status_code=413, detail="Файл слишком большой.")
             out.write(chunk)
-
     upload_id = hashlib.sha256(f"{user_id}-{tmp_path}-{time.time()}".encode()).hexdigest()[:24]
-    UPLOADS[upload_id] = {
-        "path": tmp_path,
-        "user_id": user_id,
-        "username": username,
-        "created_at": time.time(),
-    }
-
+    UPLOADS[upload_id] = {"path": tmp_path, "user_id": user_id, "username": username, "created_at": time.time()}
     logger.info(f"Файл загружен: user={user_id}, size={size/1024/1024:.1f} МБ, upload_id={upload_id}")
-
     return {"upload_id": upload_id, "size_mb": round(size / 1024 / 1024, 1)}
 
 
@@ -190,6 +149,16 @@ async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)
     if not core.check_access(user_id, username):
         raise HTTPException(status_code=403, detail="Лимит бесплатных документов исчерпан.")
 
+    # проверка доступа к аудиту
+    if req.doc_type == 'audit':
+        audit_status = core.check_audit_access(user_id, username)
+        if audit_status == 'no_sub':
+            raise HTTPException(status_code=403, detail="Лимит бесплатных документов исчерпан. Оформите подписку: /subscribe")
+        if audit_status == 'need_pro':
+            raise HTTPException(status_code=403, detail="Аудит звонков доступен на тарифе Про или при покупке пакета аудитов. Оформить: /subscribe")
+        if audit_status == 'no_credits':
+            raise HTTPException(status_code=403, detail="Аудиты закончились. Докупите пакет: /subscribe")
+
     path = record["path"]
     try:
         transcription = core.transcribe_audio_file(path)
@@ -213,30 +182,30 @@ async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)
         raise HTTPException(status_code=500, detail="Не удалось составить документ.")
 
     fname = core.safe_filename(doc_name)
-
     docx_buf = core.build_docx(doc_name, clean_text)
     txt_buf = core.build_txt(doc_name, clean_text)
 
-    await bot.send_document(
-        chat_id=user_id,
-        document=docx_buf,
-        filename=f"{fname}.docx",
-        caption="📎 .docx",
-    )
-    await bot.send_document(
-        chat_id=user_id,
-        document=txt_buf,
-        filename=f"{fname}.txt",
-        caption="📎 .txt",
-    )
-    await bot.send_message(
-        chat_id=user_id,
-        text=(
-            "✨ Документ сформирован и отправлен.\n\n"
-            "⚠️ Проверьте и исправьте цифры, имена и правовые ссылки перед использованием."
-        ),
-    )
+    await bot.send_document(chat_id=user_id, document=docx_buf, filename=f"{fname}.docx", caption="📎 .docx")
+    await bot.send_document(chat_id=user_id, document=txt_buf, filename=f"{fname}.txt", caption="📎 .txt")
+
+    # списание аудита
+    if req.doc_type == 'audit':
+        a_status = core.check_audit_access(user_id, username)
+        if a_status == 'ok':
+            core.use_audit_credit(user_id)
 
     core.increment_usage(user_id)
 
-    return {"status": "ok", "doc_name": doc_name}
+    finish_text = "✨ Документ сформирован и отправлен.\n\n⚠️ Проверьте цифры, имена и ссылки перед использованием."
+    if req.doc_type == 'audit':
+        info = core.get_user_info(user_id)
+        if info:
+            finish_text += f"\n\n🔍 Осталось аудитов: {info['audit_credits']}"
+
+    await bot.send_message(chat_id=user_id, text=finish_text)
+
+    result = {"status": "ok", "doc_name": doc_name}
+    if req.doc_type == 'audit':
+        info = core.get_user_info(user_id)
+        result["audit_credits"] = info['audit_credits'] if info else 0
+    return result
