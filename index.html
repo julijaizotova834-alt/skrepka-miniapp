@@ -302,7 +302,6 @@
   <div id="thread"></div>
 
   <div id="bottomMenu">
-    <button class="menu-btn" id="menuHome" type="button">🏠 Главное меню</button>
     <button class="menu-btn" id="menuStatus" type="button">💫 Мой тариф</button>
   </div>
 
@@ -714,9 +713,6 @@ async function generateDoc(docType, status) {
     scrollDown();
   }
 }
-
-document.getElementById("menuHome")
-  .addEventListener("click", resetToMenu);
 
 document.getElementById("menuStatus")
   .addEventListener("click", async () => {
