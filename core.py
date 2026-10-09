@@ -3,7 +3,7 @@ core.py — Skrepka AI
 Общая логика для бота и мини-приложения.
 """
 
-import os, re, logging, tempfile
+import os, re, logging, tempfile, shutil, shutil
 from io import BytesIO
 from datetime import datetime
 
@@ -16,9 +16,19 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 logger = logging.getLogger(__name__)
 
-groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
-genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+def _groq_client():
+    key = os.environ.get('GROQ_API_KEY')
+    if not key:
+        raise RuntimeError('GROQ_API_KEY is not configured')
+    return Groq(api_key=key)
+
+def _gemini_model():
+    key = os.environ.get('GEMINI_API_KEY')
+    if not key:
+        raise RuntimeError('GEMINI_API_KEY is not configured')
+    genai.configure(api_key=key)
+    return genai.GenerativeModel('gemini-2.5-flash')
+
 
 BOT_NAME = 'skrepka'
 FREE_LIMIT = 7
@@ -98,37 +108,75 @@ def check_access(uid, uname):
     return info['usage'] < FREE_LIMIT
 
 def check_audit_access(uid, uname):
-    """Audit is standalone: a subscription is not required.
+    """Returns free (privileged), free_ok (free quota), credit (paid credit), or need_credits.
 
-    Returns:
-      free_ok: user can use one of the remaining free processing attempts
-      ok: a paid audit credit is available
-      need_credits: no free attempts and no audit credits remain
+    Audit is separate from subscription. Paid credits are used before free quota for
+    ordinary users; privileged usernames never consume quota or credits.
     """
-    if uname and uname.lower() in FREE_USERNAMES:
-        return 'free_ok'
+    if uname and uname.strip().lstrip('@').lower() in FREE_USERNAMES:
+        return 'free'
     info = get_user_info(uid)
     if not info:
         return 'free_ok'
+    if has_active_sub(info):
+        return 'credit' if info['credits'] > 0 else 'need_credits'
+    if info['credits'] > 0:
+        return 'credit'
     if info['usage'] < FREE_LIMIT:
         return 'free_ok'
-    if info['credits'] > 0:
-        return 'ok'
     return 'need_credits'
 
-def try_use_audit_credit(uid):
-    """Atomically deduct one paid audit credit; return False if none remain."""
+
+def reserve_free_usage(uid, uname=''):
+    """Atomically reserve one free attempt. Returns True for privileged/subscribed users
+    (no quota consumed), False if the free quota is exhausted, otherwise True after
+    incrementing usage. Call release_free_usage only when this reservation was counted.
+    """
+    if uname and uname.strip().lstrip('@').lower() in FREE_USERNAMES:
+        return True
     conn = get_db()
     try:
-        cur = conn.cursor()
-        cur.execute('UPDATE users SET audit_credits=audit_credits-1 WHERE user_id=%s AND bot_name=%s AND audit_credits>0', (uid, BOT_NAME))
-        ok = cur.rowcount > 0
-        conn.commit()
-        cur.close()
-        return ok
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE users SET usage_count=usage_count+1, last_used_at=NOW()
+                WHERE user_id=%s AND bot_name=%s AND usage_count < %s
+                AND NOT (is_subscribed=TRUE AND subscription_until>NOW())
+                RETURNING usage_count""", (uid, BOT_NAME, FREE_LIMIT))
+            if cur.fetchone():
+                conn.commit(); return True
+            cur.execute("""SELECT 1 FROM users WHERE user_id=%s AND bot_name=%s
+                AND is_subscribed=TRUE AND subscription_until>NOW()""", (uid, BOT_NAME))
+            subscribed = cur.fetchone() is not None
+            conn.commit()
+            return subscribed
     except Exception:
-        conn.rollback()
-        raise
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def release_free_usage(uid):
+    """Roll back a previously counted free attempt after processing/delivery failure."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET usage_count=GREATEST(0, usage_count-1) WHERE user_id=%s AND bot_name=%s", (uid, BOT_NAME))
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def try_use_audit_credit(uid):
+    """Atomically deduct one paid audit credit."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE users SET audit_credits=audit_credits-1 WHERE user_id=%s AND bot_name=%s AND audit_credits>0', (uid, BOT_NAME))
+            ok = cur.rowcount > 0
+        conn.commit(); return ok
+    except Exception:
+        conn.rollback(); raise
     finally:
         conn.close()
 
@@ -176,41 +224,82 @@ def build_docx(title, body):
 def safe_filename(n): return re.sub(r'[^\w\-]', '', n.replace(' ', '_'))
 
 def compress_audio(p):
-    import subprocess; o = p + '.compressed.mp3'
+    import subprocess
+    output = p + '.compressed.mp3'
     try:
-        subprocess.run(['ffmpeg','-y','-i',p,'-ac','1','-ar','16000','-b:a','32k',o], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
-        if os.path.exists(o) and os.path.getsize(o) > 0: return o
-    except: pass
+        subprocess.run(['ffmpeg', '-y', '-i', p, '-ac', '1', '-ar', '16000', '-b:a', '32k', output],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+        if os.path.exists(output) and os.path.getsize(output) > 0:
+            return output
+    except Exception:
+        logger.exception('Audio compression failed; trying original audio')
+    try: os.remove(output)
+    except OSError: pass
     return p
 
 def split_audio_chunks(input_path, chunk_minutes=25):
-    import subprocess; out_dir = tempfile.mkdtemp()
-    pattern = os.path.join(out_dir, "chunk_%03d.mp3")
-    subprocess.run(['ffmpeg','-y','-i',input_path,'-f','segment','-segment_time',str(chunk_minutes*60),'-ac','1','-ar','16000','-b:a','32k',pattern], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
-    return sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("chunk_"))
+    import subprocess
+    out_dir = tempfile.mkdtemp(prefix='skrepka_chunks_')
+    pattern = os.path.join(out_dir, 'chunk_%03d.mp3')
+    try:
+        subprocess.run(['ffmpeg', '-y', '-i', input_path, '-f', 'segment', '-segment_time', str(chunk_minutes * 60),
+                        '-ac', '1', '-ar', '16000', '-b:a', '32k', pattern],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+        chunks = sorted(os.path.join(out_dir, name) for name in os.listdir(out_dir) if name.startswith('chunk_'))
+        if not chunks:
+            raise RuntimeError('ffmpeg produced no audio chunks')
+        return chunks
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
 
 def transcribe_audio_file(path):
-    size_mb = os.path.getsize(path) / (1024*1024)
-    chunk_paths = [path]; cleanup = []
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    chunk_paths = [path]
+    cleanup_files = []
+    cleanup_dirs = []
     if size_mb > GROQ_SIZE_LIMIT_MB:
-        try: chunk_paths = split_audio_chunks(path); cleanup = chunk_paths
-        except:
-            c = compress_audio(path); chunk_paths = [c]
-            if c != path: cleanup = [c]
+        try:
+            chunk_paths = split_audio_chunks(path)
+            cleanup_files = list(chunk_paths)
+            if chunk_paths:
+                cleanup_dirs.append(os.path.dirname(chunk_paths[0]))
+            if not chunk_paths:
+                raise RuntimeError('ffmpeg did not produce audio chunks')
+        except Exception:
+            for d in cleanup_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+            cleanup_dirs.clear()
+            compressed = compress_audio(path)
+            chunk_paths = [compressed]
+            if compressed != path:
+                cleanup_files = [compressed]
     parts = []
+    client = _groq_client()
     try:
-        for p in chunk_paths:
-            with open(p, 'rb') as f:
-                t = groq_client.audio.transcriptions.create(file=(os.path.basename(p), f.read()), model='whisper-large-v3-turbo', language='ru')
-            parts.append(t.text)
+        for chunk_path in chunk_paths:
+            with open(chunk_path, 'rb') as f:
+                result = client.audio.transcriptions.create(
+                    file=(os.path.basename(chunk_path), f.read()),
+                    model='whisper-large-v3-turbo', language='ru')
+            text = getattr(result, 'text', '') or ''
+            if text.strip():
+                parts.append(text.strip())
     finally:
-        for p in cleanup:
-            try: os.remove(p)
-            except: pass
-    return "\n\n".join(parts)
+        for item in cleanup_files:
+            try: os.remove(item)
+            except OSError: pass
+        for directory in cleanup_dirs:
+            shutil.rmtree(directory, ignore_errors=True)
+    return '\n\n'.join(parts)
 
 def generate_document(doc_type, transcription):
     doc_name = DOC_NAMES[doc_type]
     if doc_type == 'transcript': return doc_name, transcription.strip()
-    resp = gemini_model.generate_content(f"{PROMPTS[doc_type]}\n\nВот транскрипция записи:\n\n{transcription}")
-    return doc_name, clean_markdown(resp.text)
+    if doc_type not in PROMPTS:
+        raise ValueError(f'Unknown document type: {doc_type}')
+    resp = _gemini_model().generate_content(f"{PROMPTS[doc_type]}\n\nВот транскрипция записи:\n\n{transcription}")
+    result = getattr(resp, 'text', None)
+    if not result or not result.strip():
+        raise RuntimeError('AI returned an empty document')
+    return doc_name, clean_markdown(result)
