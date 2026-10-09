@@ -6,6 +6,8 @@ import json
 import tempfile
 import logging
 import time
+import threading
+import threading
 from urllib.parse import parse_qsl
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException
@@ -36,7 +38,10 @@ core.init_db()
 
 UPLOADS = {}
 UPLOAD_TTL = 3600
-MAX_UPLOAD = 1024 * 1024 * 1024
+MAX_UPLOAD = int(os.environ.get('MAX_UPLOAD_BYTES', str(1024 * 1024 * 1024)))
+MAX_PENDING_UPLOADS = int(os.environ.get('MAX_PENDING_UPLOADS', '300'))
+UPLOAD_LOCK = threading.Lock()
+PROCESSING = set()
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("🏠 Главное меню"), KeyboardButton("💫 Мой тариф")]],
     resize_keyboard=True,
@@ -48,7 +53,10 @@ def validate_init_data(init_data: str | None):
     if not init_data:
         raise HTTPException(status_code=401, detail="Нет initData")
     try:
-        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+        pairs = parse_qsl(init_data, strict_parsing=True, keep_blank_values=True)
+        if len({k for k, _ in pairs}) != len(pairs):
+            raise ValueError('duplicate initData keys')
+        parsed = dict(pairs)
     except ValueError:
         raise HTTPException(status_code=401, detail="Некорректная initData")
     received_hash = parsed.pop("hash", None)
@@ -71,21 +79,26 @@ def validate_init_data(init_data: str | None):
         user = json.loads(parsed.get("user", "{}"))
     except json.JSONDecodeError:
         raise HTTPException(status_code=401, detail="Некорректные данные пользователя")
-    if not user.get("id"):
+    try:
+        user_id = int(user.get("id", 0))
+    except (TypeError, ValueError):
+        user_id = 0
+    if user_id <= 0:
         raise HTTPException(status_code=401, detail="Нет данных пользователя")
+    user["id"] = user_id
     return user
 
 
 def cleanup():
     now = time.time()
-    expired = [upload_id for upload_id, record in UPLOADS.items()
-               if now - record["created_at"] > UPLOAD_TTL]
-    for upload_id in expired:
-        try:
-            os.remove(UPLOADS[upload_id]["path"])
-        except OSError:
-            pass
-        UPLOADS.pop(upload_id, None)
+    with UPLOAD_LOCK:
+        expired = [upload_id for upload_id, record in UPLOADS.items()
+                   if upload_id not in PROCESSING and now - record["created_at"] > UPLOAD_TTL]
+        records = [UPLOADS.pop(upload_id, None) for upload_id in expired]
+    for record in records:
+        if record:
+            try: os.remove(record["path"])
+            except OSError: pass
 
 
 def user_details(user):
@@ -128,8 +141,13 @@ async def upload(file: UploadFile = File(...), x_telegram_initdata: str = Header
     uid = int(user["id"])
     uname = user.get("username", "")
     user_details(user)
-    suffix = os.path.splitext(file.filename or "audio")[1] or ".audio"
-    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    with UPLOAD_LOCK:
+        if len(UPLOADS) >= MAX_PENDING_UPLOADS:
+            raise HTTPException(status_code=503, detail="Сервис временно перегружен. Попробуйте позже.")
+    suffix = os.path.splitext(file.filename or "audio")[1].lower()
+    if not suffix or len(suffix) > 12 or not suffix[1:].isalnum():
+        suffix = ".audio"
+    fd, tmp_path = tempfile.mkstemp(prefix="skrepka_", suffix=suffix)
     os.close(fd)
     size = 0
     try:
@@ -150,13 +168,18 @@ async def upload(file: UploadFile = File(...), x_telegram_initdata: str = Header
         raise
     finally:
         await file.close()
+    if size == 0:
+        try: os.remove(tmp_path)
+        except OSError: pass
+        raise HTTPException(status_code=400, detail="Файл пустой. Выберите аудиозапись.")
     upload_id = hashlib.sha256(f"{uid}-{tmp_path}-{time.time()}".encode()).hexdigest()[:24]
-    UPLOADS[upload_id] = {
-        "path": tmp_path,
-        "user_id": uid,
-        "username": uname,
-        "created_at": time.time(),
-    }
+    with UPLOAD_LOCK:
+        UPLOADS[upload_id] = {
+            "path": tmp_path,
+            "user_id": uid,
+            "username": uname,
+            "created_at": time.time(),
+        }
     return {"upload_id": upload_id, "size_mb": round(size / 1024 / 1024, 1)}
 
 
@@ -168,95 +191,99 @@ class GenerateRequest(BaseModel):
 @app.post("/api/generate")
 async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)):
     user = validate_init_data(x_telegram_initdata)
-    uid, uname, _, _ = user_details(user)
-    record = UPLOADS.get(req.upload_id)
-    if not record or record["user_id"] != uid:
-        raise HTTPException(status_code=404, detail="Загрузка не найдена. Прикрепите файл ещё раз.")
+    uid, uname, initial_info, initial_active = user_details(user)
     if req.doc_type not in core.DOC_NAMES:
         raise HTTPException(status_code=400, detail="Неизвестный тип документа.")
 
-    is_audit = req.doc_type == "audit"
-    audit_status = None
-    if is_audit:
-        audit_status = core.check_audit_access(uid, uname)
-        if audit_status == "need_credits":
-            raise HTTPException(
-                status_code=403,
-                detail="Бесплатные обработки закончились, а кредитов на аудит нет. Купите пакет аудитов в Telegram-боте.",
-            )
-    elif not core.check_access(uid, uname):
-        raise HTTPException(
-            status_code=403,
-            detail="Бесплатный лимит основных функций исчерпан. Оформите подписку Skrepka в Telegram-боте.",
-        )
+    # Claim the upload before any await/long-running operation so two requests cannot
+    # process the same upload concurrently in a single worker.
+    with UPLOAD_LOCK:
+        record = UPLOADS.get(req.upload_id)
+        if not record or record["user_id"] != uid:
+            raise HTTPException(status_code=404, detail="Загрузка не найдена. Прикрепите файл ещё раз.")
+        if req.upload_id in PROCESSING:
+            raise HTTPException(status_code=409, detail="Эта запись уже обрабатывается.")
+        PROCESSING.add(req.upload_id)
+        UPLOADS.pop(req.upload_id, None)
 
     path = record["path"]
+    is_audit = req.doc_type == "audit"
+    paid_audit = False
+    free_quota_reserved = False
+    delivered = False
     try:
+        if is_audit:
+            audit_status = core.check_audit_access(uid, uname)
+            if audit_status == "need_credits":
+                raise HTTPException(status_code=403, detail="Бесплатные обработки закончились, а кредитов на аудит нет. Купите пакет аудитов в Telegram-боте.")
+            if audit_status == "credit":
+                if not core.try_use_audit_credit(uid):
+                    raise HTTPException(status_code=409, detail="Кредиты на аудит закончились. Обновите баланс и попробуйте снова.")
+                paid_audit = True
+            elif audit_status == "free_ok":
+                if not core.reserve_free_usage(uid, uname):
+                    raise HTTPException(status_code=403, detail="Бесплатный лимит исчерпан. Купите кредиты на аудит или оформите подписку для основных функций.")
+                # privileged users/subscribers are not counted; ordinary free users are.
+                free_quota_reserved = not (uname and uname.strip().lstrip('@').lower() in core.FREE_USERNAMES) and not initial_active
+        else:
+            if not core.check_access(uid, uname):
+                raise HTTPException(status_code=403, detail="Бесплатный лимит основных функций исчерпан. Оформите подписку Skrepka в Telegram-боте.")
+            if not (uname and uname.strip().lstrip('@').lower() in core.FREE_USERNAMES) and not initial_active:
+                if not core.reserve_free_usage(uid, uname):
+                    raise HTTPException(status_code=403, detail="Бесплатный лимит основных функций исчерпан. Оформите подписку Skrepka в Telegram-боте.")
+                free_quota_reserved = True
+
         try:
-            transcription = core.transcribe_audio_file(path)
+            transcription = await __import__('asyncio').to_thread(core.transcribe_audio_file, path)
         except Exception as exc:
             logger.exception("Транскрибация завершилась ошибкой: %s", exc)
             raise HTTPException(status_code=500, detail="Не удалось распознать запись. Попробуйте ещё раз.")
-    finally:
+        if not transcription or len(transcription.strip()) < 10:
+            raise HTTPException(status_code=422, detail="Речь не распознана. Попробуйте запись с более разборчивой речью.")
         try:
-            os.remove(path)
-        except OSError:
-            pass
-        UPLOADS.pop(req.upload_id, None)
+            doc_name, clean_text = await __import__('asyncio').to_thread(core.generate_document, req.doc_type, transcription)
+            docx_file = core.build_docx(doc_name, clean_text)
+        except Exception as exc:
+            logger.exception("Генерация документа завершилась ошибкой: %s", exc)
+            raise HTTPException(status_code=500, detail="Не удалось составить документ. Попробуйте ещё раз.")
 
-    if not transcription or len(transcription.strip()) < 10:
-        raise HTTPException(status_code=422, detail="Речь не распознана. Попробуйте запись с более разборчивой речью.")
+        try:
+            if not bot:
+                raise RuntimeError("Telegram bot is not configured")
+            filename = core.safe_filename(doc_name) or "Skrepka_document"
+            await bot.send_document(chat_id=uid, document=docx_file, filename=f"{filename}.docx", caption="📎 Документ Word (.docx)")
+            delivered = True
+        except Exception as exc:
+            logger.exception("Не удалось отправить результат в Telegram: %s", exc)
+            raise HTTPException(status_code=502, detail="Не удалось отправить документ в Telegram. Попробуйте загрузить запись ещё раз.")
 
-    try:
-        doc_name, clean_text = core.generate_document(req.doc_type, transcription)
-    except Exception as exc:
-        logger.exception("Генерация документа завершилась ошибкой: %s", exc)
-        raise HTTPException(status_code=500, detail="Не удалось составить документ. Попробуйте ещё раз.")
-
-    # If this audit uses a purchased credit, reserve it atomically after successful generation.
-    paid_audit = is_audit and audit_status == "credit"
-    if paid_audit and not core.try_use_audit_credit(uid):
-        raise HTTPException(status_code=409, detail="Кредиты на аудит закончились. Обновите баланс и попробуйте снова.")
-
-    try:
-        if not bot:
-            raise RuntimeError("Telegram bot is not configured")
-        filename = core.safe_filename(doc_name)
-        await bot.send_document(chat_id=uid, document=core.build_docx(doc_name, clean_text),
-                                filename=f"{filename}.docx", caption="📎 .docx")
-    except Exception as exc:
-        logger.exception("Не удалось отправить результат в Telegram: %s", exc)
-        if paid_audit:
-            try:
-                core.refund_audit_credit(uid)
-            except Exception:
-                logger.exception("Не удалось вернуть кредит после ошибки отправки")
-        raise HTTPException(status_code=502, detail="Документ подготовлен, но отправить его в Telegram не удалось. Попробуйте позже.")
-
-    # Paid audits do not consume the free quota for core features.
-    if not paid_audit:
-        core.increment_usage(uid)
-
-    info = core.get_user_info(uid) or {"credits": 0, "usage": 0, "sub": False, "until": None}
-    if is_audit:
-        finish = (
-            "✨ Аудит готов!\n\nДокумент Word отправлен в чат.\n"
-            f"\n🔍 Осталось кредитов на аудит: {info['credits']}"
-            "\n\n⚠️ Проверяйте выводы по исходной записи."
-        )
-    else:
-        finish = "✨ Документ готов! Документ Word (.docx) отправлен в чат.\n\n⚠️ Проверьте цифры, имена и ссылки перед использованием."
-
-    try:
-        await bot.send_message(chat_id=uid, text=finish, reply_markup=MENU_KEYBOARD)
+        info = core.get_user_info(uid) or {"credits": 0, "usage": 0, "sub": False, "until": None}
+        if is_audit:
+            finish = ("✨ Аудит готов!\n\nДокумент Word отправлен в чат.\n"
+                      f"\n🔍 Осталось кредитов на аудит: {info['credits']}"
+                      "\n\n⚠️ Проверяйте выводы по исходной записи.")
+        else:
+            finish = "✨ Документ готов! Документ Word (.docx) отправлен в чат.\n\n⚠️ Проверьте цифры, имена и ссылки перед использованием."
+        try:
+            await bot.send_message(chat_id=uid, text=finish, reply_markup=MENU_KEYBOARD)
+        except Exception:
+            logger.exception("Не удалось отправить завершающее сообщение с меню")
+        info = core.get_user_info(uid) or info
+        return {"status": "ok", "doc_name": doc_name, "audit_credits": info["credits"],
+                "is_subscribed": core.has_active_sub(info),
+                "remaining": max(0, core.FREE_LIMIT - info["usage"]), "message": finish}
     except Exception:
-        logger.exception("Не удалось отправить завершающее сообщение с меню")
-
-    return {
-        "status": "ok",
-        "doc_name": doc_name,
-        "audit_credits": info["credits"],
-        "is_subscribed": core.has_active_sub(info),
-        "remaining": max(0, core.FREE_LIMIT - info["usage"]),
-        "message": finish,
-    }
+        # Once Telegram accepted the DOCX, don't refund: delivery may have succeeded
+        # even if a later status/message operation fails.
+        if not delivered and paid_audit:
+            try: core.refund_audit_credit(uid)
+            except Exception: logger.exception("Не удалось вернуть кредит после ошибки")
+        if not delivered and free_quota_reserved:
+            try: core.release_free_usage(uid)
+            except Exception: logger.exception("Не удалось вернуть бесплатную обработку после ошибки")
+        raise
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+        with UPLOAD_LOCK:
+            PROCESSING.discard(req.upload_id)
