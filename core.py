@@ -3,7 +3,7 @@ core.py — Skrepka AI
 Общая логика для бота и мини-приложения.
 """
 
-import os, re, logging, tempfile, shutil, shutil
+import os, re, logging, tempfile, shutil
 from io import BytesIO
 from datetime import datetime
 
@@ -194,6 +194,19 @@ def refund_audit_credit(uid):
     finally:
         conn.close()
 
+def convert_markdown_tables(text):
+    """Convert markdown tables into readable bullet-point lists."""
+    lines = text.split('\n'); result = []; headers = None
+    for line in lines:
+        s = line.strip()
+        if not s.startswith('|'): headers = None; result.append(line); continue
+        cells = [c.strip() for c in s.strip('|').split('|')]
+        if all(re.fullmatch(r':?-+:?', c) for c in cells if c): continue
+        if headers is None: headers = cells; continue
+        parts = [f"{h}: {v}" if h else v for h, v in zip(headers, cells) if v]
+        if parts: result.append("• " + " | ".join(parts))
+    return '\n'.join(result)
+
 def clean_markdown(text):
     if not text: return text
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
@@ -201,6 +214,8 @@ def clean_markdown(text):
     text = re.sub(r'\*(.+?)\*', r'\1', text); text = re.sub(r'_(.+?)_', r'\1', text)
     text = re.sub(r'```[a-zA-Z]*\n?', '', text); text = re.sub(r'`(.+?)`', r'\1', text)
     text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)
+    if '|' in text:
+        text = convert_markdown_tables(text)
     return text.strip()
 
 def build_docx(title, body):
