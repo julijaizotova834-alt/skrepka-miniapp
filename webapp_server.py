@@ -6,7 +6,7 @@ import json
 import tempfile
 import logging
 import time
-import threading
+import asyncio
 import threading
 from urllib.parse import parse_qsl
 
@@ -234,14 +234,14 @@ async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)
                 free_quota_reserved = True
 
         try:
-            transcription = await __import__('asyncio').to_thread(core.transcribe_audio_file, path)
+            transcription = await asyncio.to_thread(core.transcribe_audio_file, path)
         except Exception as exc:
             logger.exception("Транскрибация завершилась ошибкой: %s", exc)
             raise HTTPException(status_code=500, detail="Не удалось распознать запись. Попробуйте ещё раз.")
         if not transcription or len(transcription.strip()) < 10:
             raise HTTPException(status_code=422, detail="Речь не распознана. Попробуйте запись с более разборчивой речью.")
         try:
-            doc_name, clean_text = await __import__('asyncio').to_thread(core.generate_document, req.doc_type, transcription)
+            doc_name, clean_text = await asyncio.to_thread(core.generate_document, req.doc_type, transcription)
             docx_file = core.build_docx(doc_name, clean_text)
         except Exception as exc:
             logger.exception("Генерация документа завершилась ошибкой: %s", exc)
