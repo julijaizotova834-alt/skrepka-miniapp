@@ -214,7 +214,7 @@ async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)
         raise HTTPException(status_code=500, detail="Не удалось составить документ. Попробуйте ещё раз.")
 
     # If this audit uses a purchased credit, reserve it atomically after successful generation.
-    paid_audit = is_audit and audit_status == "ok"
+    paid_audit = is_audit and audit_status == "credit"
     if paid_audit and not core.try_use_audit_credit(uid):
         raise HTTPException(status_code=409, detail="Кредиты на аудит закончились. Обновите баланс и попробуйте снова.")
 
