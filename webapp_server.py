@@ -224,8 +224,6 @@ async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)
         filename = core.safe_filename(doc_name)
         await bot.send_document(chat_id=uid, document=core.build_docx(doc_name, clean_text),
                                 filename=f"{filename}.docx", caption="📎 .docx")
-        await bot.send_document(chat_id=uid, document=core.build_txt(doc_name, clean_text),
-                                filename=f"{filename}.txt", caption="📎 .txt")
     except Exception as exc:
         logger.exception("Не удалось отправить результат в Telegram: %s", exc)
         if paid_audit:
@@ -242,12 +240,12 @@ async def generate(req: GenerateRequest, x_telegram_initdata: str = Header(None)
     info = core.get_user_info(uid) or {"credits": 0, "usage": 0, "sub": False, "until": None}
     if is_audit:
         finish = (
-            "✨ Аудит готов!\n\nДокументы отправлены в чат.\n"
+            "✨ Аудит готов!\n\nДокумент Word отправлен в чат.\n"
             f"\n🔍 Осталось кредитов на аудит: {info['credits']}"
             "\n\n⚠️ Проверяйте выводы по исходной записи."
         )
     else:
-        finish = "✨ Документ готов! Файлы .docx и .txt отправлены в чат.\n\n⚠️ Проверьте цифры, имена и ссылки перед использованием."
+        finish = "✨ Документ готов! Документ Word (.docx) отправлен в чат.\n\n⚠️ Проверьте цифры, имена и ссылки перед использованием."
 
     try:
         await bot.send_message(chat_id=uid, text=finish, reply_markup=MENU_KEYBOARD)
