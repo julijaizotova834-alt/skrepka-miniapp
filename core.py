@@ -20,7 +20,7 @@ groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
-BOT_NAME = 'skrepka_ru'
+BOT_NAME = 'skrepka'
 FREE_LIMIT = 7
 GROQ_SIZE_LIMIT_MB = 24
 PRICE_SUB = 750
@@ -98,19 +98,53 @@ def check_access(uid, uname):
     return info['usage'] < FREE_LIMIT
 
 def check_audit_access(uid, uname):
-    if uname and uname.lower() in FREE_USERNAMES: return 'ok'
+    """Audit is standalone: a subscription is not required.
+
+    Returns:
+      free_ok: user can use one of the remaining free processing attempts
+      ok: a paid audit credit is available
+      need_credits: no free attempts and no audit credits remain
+    """
+    if uname and uname.lower() in FREE_USERNAMES:
+        return 'free_ok'
     info = get_user_info(uid)
-    if not info: return 'free_ok'
-    if not has_active_sub(info) and info['usage'] < FREE_LIMIT: return 'free_ok'
-    if not has_active_sub(info) and info['credits'] > 0: return 'need_sub_for_credits'
-    if not has_active_sub(info): return 'no_sub'
-    if info['credits'] > 0: return 'ok'
+    if not info:
+        return 'free_ok'
+    if info['usage'] < FREE_LIMIT:
+        return 'free_ok'
+    if info['credits'] > 0:
+        return 'ok'
     return 'need_credits'
 
 def try_use_audit_credit(uid):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('UPDATE users SET audit_credits=audit_credits-1 WHERE user_id=%s AND bot_name=%s AND audit_credits>0', (uid, BOT_NAME))
-    ok = cur.rowcount > 0; conn.commit(); cur.close(); conn.close(); return ok
+    """Atomically deduct one paid audit credit; return False if none remain."""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET audit_credits=audit_credits-1 WHERE user_id=%s AND bot_name=%s AND audit_credits>0', (uid, BOT_NAME))
+        ok = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        return ok
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def refund_audit_credit(uid):
+    """Restore a credit if delivery fails after an audit credit was deducted."""
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET audit_credits=audit_credits+1 WHERE user_id=%s AND bot_name=%s', (uid, BOT_NAME))
+        conn.commit()
+        cur.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def clean_markdown(text):
     if not text: return text
