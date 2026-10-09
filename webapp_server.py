@@ -39,7 +39,6 @@ UPLOAD_TTL = 3600
 MAX_UPLOAD = 1024 * 1024 * 1024
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("🏠 Главное меню"), KeyboardButton("💫 Мой тариф")],
-     [KeyboardButton("🔍 Купить аудит")]],
     resize_keyboard=True,
     is_persistent=True,
 )
