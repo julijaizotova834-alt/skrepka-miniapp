@@ -98,23 +98,27 @@ def check_access(uid, uname):
     return info['usage'] < FREE_LIMIT
 
 def check_audit_access(uid, uname):
-    """Audit is standalone: a subscription is not required.
+    '''Return 'free' for privileged users, 'free_ok' for trial,
+    'credit' when a paid credit must be used, or 'need_credits'.
 
-    Returns:
-      free_ok: user can use one of the remaining free processing attempts
-      ok: a paid audit credit is available
-      need_credits: no free attempts and no audit credits remain
-    """
+    Audit is not included in a subscription. Subscribers need audit credits.
+    Purchased credits are used before free trial attempts for non-subscribers.
+    '''
     if uname and uname.lower() in FREE_USERNAMES:
-        return 'free_ok'
+        return 'free'
+
     info = get_user_info(uid)
     if not info:
         return 'free_ok'
+
+    if has_active_sub(info):
+        return 'credit' if info['credits'] > 0 else 'need_credits'
+    if info['credits'] > 0:
+        return 'credit'
     if info['usage'] < FREE_LIMIT:
         return 'free_ok'
-    if info['credits'] > 0:
-        return 'ok'
     return 'need_credits'
+
 
 def try_use_audit_credit(uid):
     """Atomically deduct one paid audit credit; return False if none remain."""
@@ -146,6 +150,128 @@ def refund_audit_credit(uid):
     finally:
         conn.close()
 
+def is_charge_processed(charge_id):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT 1 FROM payments WHERE telegram_payment_charge_id=%s',
+                (charge_id,),
+            )
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def process_successful_payment(uid, charge_id, stars, payload):
+    '''Validate and atomically apply a Telegram Stars payment.
+
+    Returns ('duplicate', None), ('subscription', subscription_until), or
+    ('audit', total_audit_credits). Unknown payloads and wrong amounts are rejected.
+    '''
+    if not charge_id or not payload:
+        raise ValueError('Missing charge id or invoice payload')
+
+    if payload == 'sub_30':
+        expected_stars = PRICE_SUB
+        payment_type = 'subscription'
+        audit_size = 0
+    else:
+        pack = next((p for p in AUDIT_PACKS if payload == f"audit_{p['size']}"), None)
+        if pack is None:
+            raise ValueError('Unknown payment payload')
+        expected_stars = pack['price']
+        payment_type = 'audit'
+        audit_size = pack['size']
+
+    if int(stars) != int(expected_stars):
+        raise ValueError('Payment amount does not match invoice')
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            # Ensure the row exists, then serialize changes to this user's balance.
+            cur.execute(
+                '''INSERT INTO users (user_id, bot_name, username, full_name,
+                   registered_at, usage_count, audit_credits, last_used_at)
+                   VALUES (%s, %s, '', '', NOW(), 0, 0, NOW())
+                   ON CONFLICT (user_id, bot_name) DO NOTHING''',
+                (uid, BOT_NAME),
+            )
+            cur.execute(
+                'SELECT user_id FROM users WHERE user_id=%s AND bot_name=%s FOR UPDATE',
+                (uid, BOT_NAME),
+            )
+            if not cur.fetchone():
+                raise RuntimeError('User row could not be created')
+
+            cur.execute(
+                '''INSERT INTO payments
+                   (user_id, bot_name, telegram_payment_charge_id, stars_amount, payload, paid_at)
+                   VALUES (%s, %s, %s, %s, %s, NOW())
+                   ON CONFLICT (telegram_payment_charge_id) DO NOTHING
+                   RETURNING id''',
+                (uid, BOT_NAME, charge_id, int(stars), payload),
+            )
+            inserted = cur.fetchone()
+            if inserted is None:
+                conn.rollback()
+                return ('duplicate', None)
+
+            if payment_type == 'subscription':
+                cur.execute(
+                    '''UPDATE users SET is_subscribed=TRUE,
+                       subscription_until=CASE
+                         WHEN is_subscribed=TRUE AND subscription_until>NOW()
+                         THEN subscription_until + (%s * INTERVAL '1 day')
+                         ELSE NOW() + (%s * INTERVAL '1 day')
+                       END
+                       WHERE user_id=%s AND bot_name=%s
+                       RETURNING subscription_until''',
+                    (SUB_DAYS, SUB_DAYS, uid, BOT_NAME),
+                )
+                until = cur.fetchone()[0]
+                conn.commit()
+                return ('subscription', until)
+
+            cur.execute(
+                '''UPDATE users SET audit_credits=COALESCE(audit_credits, 0)+%s
+                   WHERE user_id=%s AND bot_name=%s RETURNING audit_credits''',
+                (audit_size, uid, BOT_NAME),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError('Audit credits could not be applied')
+            conn.commit()
+            return ('audit', row[0])
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def activate_subscription(uid, charge_id, stars, payload):
+    '''Backward-compatible wrapper; validates before activating.'''
+    result_type, value = process_successful_payment(uid, charge_id, stars, payload)
+    if result_type == 'subscription':
+        return value
+    if result_type == 'duplicate':
+        return None
+    raise ValueError('Payment payload is not a subscription')
+
+
+def add_audit_credits(uid, amount, charge_id, stars, payload):
+    '''Backward-compatible wrapper; amount must match a known audit pack.'''
+    result_type, value = process_successful_payment(uid, charge_id, stars, payload)
+    if result_type == 'audit':
+        expected = next(p['size'] for p in AUDIT_PACKS if payload == f"audit_{p['size']}")
+        if int(amount) != expected:
+            raise ValueError('Audit pack size does not match payload')
+        return value
+    if result_type == 'duplicate':
+        return None
+    raise ValueError('Payment payload is not an audit pack')
 def clean_markdown(text):
     if not text: return text
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
