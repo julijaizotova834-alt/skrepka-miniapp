@@ -301,10 +301,9 @@
 
   <div id="thread"></div>
 
-  <!-- Только две кнопки в нижнем меню Mini App -->
-    <button class="menu-btn" id="menuStatus" type="button">
-      💫 Мой тариф
-    </button>
+  <div id="bottomMenu">
+    <button class="menu-btn" id="menuHome" type="button">🏠 Главное меню</button>
+    <button class="menu-btn" id="menuStatus" type="button">💫 Мой тариф</button>
   </div>
 
   <div id="composer">
@@ -657,13 +656,13 @@ async function generateDoc(docType, status) {
     if (docType === "audit") {
       message = `
         <strong>✨ Аудит готов!</strong><br><br>
-        Документы .docx и .txt отправлены в чат с ботом Telegram.<br><br>
+        Документ .docx отправлен в чат с ботом Telegram.<br><br>
         🔍 Осталось кредитов на аудит: ${Number(data.audit_credits || 0)}
       `;
     } else {
       message = `
         <strong>✨ Документ сформирован!</strong><br><br>
-        Файлы .docx и .txt отправлены в чат с ботом Telegram.<br><br>
+        Документ .docx отправлен в чат с ботом Telegram.<br><br>
         Проверьте цифры, имена и ссылки перед использованием.
       `;
     }
